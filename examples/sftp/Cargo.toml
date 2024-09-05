@@ -7,8 +7,9 @@ edition = "2021"
 wincs = { path = "../../" }
 widestring = "1.0.2"
 ssh2 = "0.9.4"
-thiserror = "1.0.30"
 rkyv = "0.7.30"
 ctrlc = "3.4.4"
 clap = { version = "4.5.17", features = ["derive"] }
 strum = { version = "0.26.3", features = ["derive"] }
+snafu = { version = "0.8.4", features = ["backtrace"] }
+typed-path = "0.9.1"

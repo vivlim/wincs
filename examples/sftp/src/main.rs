@@ -1,21 +1,15 @@
 use std::{
-    env,
-    ffi::OsStr,
-    fs::{self, File},
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
-    net::TcpStream,
-    os::windows::fs::OpenOptionsExt,
-    path::Path,
-    sync::mpsc,
+    convert::Infallible, env, ffi::OsStr, fs::{self, File}, io::{self, BufWriter, Read, Seek, SeekFrom, Write}, net::TcpStream, ops::Deref, os::windows::fs::OpenOptionsExt, path::{Path, StripPrefixError}, str::FromStr, sync::mpsc
 };
 
 use clap::{arg, command, Parser};
 use rkyv::{Archive, Deserialize, Serialize};
+use snafu::Snafu;
 use ssh2::{Session, Sftp};
-use thiserror::Error;
+use typed_path::{NativePath, PathBuf, UnixPath, UnixPathBuf, Utf8NativePath, Utf8UnixPathBuf, Utf8WindowsPathBuf, WindowsEncoding, WindowsPath, WindowsPathBuf};
 use widestring::{u16str, U16String};
 use wincs::{
-    ext::{ConvertOptions, FileExt}, filter::{info, ticket, SyncFilter}, placeholder_file::{Metadata, PlaceholderFile}, request::Request, CloudErrorKind, WinCSError, PopulationType, Registration, SecurityId, SyncRootIdBuilder, WindowsError
+    ext::{ConvertOptions, FileExt}, filter::{info, ticket, SyncFilter}, placeholder_file::{Metadata, PlaceholderFile}, request::Request, CloudErrorKind, PopulationType, Registration, SecurityId, SyncRootId, SyncRootIdBuilder, WinCSError, WindowsError
 };
 
 // max should be 65536, this is done both in term-scp and sshfs because it's the
@@ -45,10 +39,13 @@ struct Args {
     host: String,
 
     #[arg(short, long)]
-    mount_path: String,
+    mount_path: LocalPath,
+
+    #[arg(short, long)]
+    remote_path: RemotePath,
 }
 
-fn main() {
+fn main() -> Result<(), SftpError> {
     let args = Args::parse();
 
     let tcp = TcpStream::connect(&args.host).unwrap();
@@ -70,37 +67,62 @@ fn main() {
         .build();
 
     let client_path = &args.mount_path;
-    if !sync_root_id.is_registered().unwrap() {
-        let u16_display_name = U16String::from_str(DISPLAY_NAME);
-        Registration::from_sync_root_id(&sync_root_id)
-            .display_name(&u16_display_name)
-            .hydration_type(wincs::HydrationType::Full)
-            .population_type(PopulationType::Full)
-            .icon(
-                U16String::from_str("%SystemRoot%\\system32\\charmap.exe"),
-                0,
-            )
-            .version(u16str!("1.0.0"))
-            .recycle_bin_uri(u16str!("http://cloudmirror.example.com/recyclebin"))
-            .register(Path::new(&client_path))
-            .unwrap();
+
+    let should_unregister = match sync_root_id.is_registered() {
+        Ok(false) => {
+            register_filter(&sync_root_id, &client_path)?;
+            true
+        },
+        Ok(true) => true,
+        Err(e) => Err(e)?
+    };
+
+    match main_loop(sftp, args) {
+        Ok(_) => {},
+        Err(e) => {
+            println!("main loop error: {:?}", e);
+        },
     }
 
-    convert_to_placeholder(Path::new(&client_path));
+    if should_unregister {
+        sync_root_id.unregister()?;
+    }
+
+    Ok(())
+}
+
+fn register_filter(sync_root_id: &SyncRootId, client_path: &LocalPath) -> Result<(), SftpError> {
+    let u16_display_name = U16String::from_str(DISPLAY_NAME);
+    Registration::from_sync_root_id(&sync_root_id)
+        .display_name(&u16_display_name)
+        .hydration_type(wincs::HydrationType::Full)
+        .population_type(PopulationType::Full)
+        .icon(
+            U16String::from_str("%SystemRoot%\\system32\\charmap.exe"),
+            0,
+        )
+        .version(u16str!("1.0.0"))
+        .recycle_bin_uri(u16str!("http://cloudmirror.example.com/recyclebin"))
+        .register(client_path)?;
+    Ok(())
+}
+
+fn main_loop(sftp: Sftp, args: Args) -> Result<(), SftpError> {
+    convert_to_placeholder(&args.mount_path)?;
 
     let connection = wincs::Session::new()
-        .connect(&client_path, Filter { sftp, args: args.clone() })
-        .unwrap();
+        .connect(&args.mount_path, Filter { sftp, args: args.clone() })?;
 
     wait_for_ctrlc();
 
-    connection.disconnect().unwrap();
-    sync_root_id.unregister().unwrap();
+    connection.disconnect()?;
+    Ok(())
 }
 
-fn convert_to_placeholder(path: &Path) {
+fn convert_to_placeholder(path: &LocalPath) -> Result<(), SftpError> {
+    println!("convert_to_placeholder {:?}", path);
     for entry in path.read_dir().unwrap() {
-        let entry = entry.unwrap();
+        let entry = entry?;
         let is_dir = entry.path().is_dir();
 
         let mut open_options = File::options();
@@ -116,13 +138,14 @@ fn convert_to_placeholder(path: &Path) {
             ConvertOptions::default()
         };
 
-        let file = open_options.open(entry.path()).unwrap();
-        file.to_placeholder(convert_options).unwrap();
+        let file = open_options.open(entry.path())?;
+        file.to_placeholder(convert_options)?;
 
         if is_dir {
-            convert_to_placeholder(&entry.path());
+            convert_to_placeholder(&LocalPath(entry.path()))?;
         }
     }
+    Ok(())
 }
 
 pub struct Filter {
@@ -149,7 +172,7 @@ impl Filter {
                     bytes_written += server_file.write(&buffer[0..bytes_read])? as u64;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(SftpError::Io(err)),
+                Err(err) => return Err(SftpError::Io { source: err }),
             }
         }
 
@@ -339,19 +362,32 @@ impl SyncFilter for Filter {
             request.path(),
             info.pattern()
         );
-        let absolute = request.path();
-        let parent = absolute.strip_prefix(&self.args.mount_path).unwrap();
+        let local_path = LocalPath(PathBuf::<WindowsEncoding>::try_from(request.path())?);
+        let local_root = &self.args.mount_path;
+        let remote_root = &self.args.remote_path;
+        let remote_path = local_path.to_remote(local_root, remote_root)?;
+        println!(
+            " ... {:?} -> {:?}",
+            local_path,
+            remote_path
+        );
 
-        let dirs = self.sftp.readdir(parent).unwrap();
+        let dirs = self.sftp.readdir(&remote_path)?;
         let mut placeholders = dirs
             .into_iter()
-            .filter(|(path, _)| !Path::new(&self.args.mount_path).join(path).exists())
+            .map(|(path, stat)| (RemotePath(path), stat))
+            .filter(|(path, _)| match path.to_local(local_root, remote_root) {
+                Ok(local_path) => !local_path.exists(),
+                Err(e) => {
+                    println!("Failed to map remote path: {:?}", e);
+                    false
+                }
+            })
             .map(|(path, stat)| {
                 println!("path: {:?}, stat {:?}", path, stat);
                 println!("is file: {}, is dir: {}", stat.is_file(), stat.is_dir());
 
-                let relative_path = path.strip_prefix(parent).unwrap();
-                PlaceholderFile::new(relative_path)
+                PlaceholderFile::new(path.to_local(local_root, remote_root).unwrap())
                     .metadata(
                         if stat.is_dir() {
                             Metadata::directory()
@@ -366,7 +402,7 @@ impl SyncFilter for Filter {
                     )
                     .overwrite()
                     // .mark_sync() // need this?
-                    .blob(path.into_os_string().into_encoded_bytes())
+                    .blob(path.0.into_os_string().into_encoded_bytes())
             })
             .collect::<Vec<_>>();
 
@@ -394,7 +430,7 @@ impl SyncFilter for Filter {
         #[allow(unused_must_use)]
         {
             ticket.fail(CloudErrorKind::NotSupported);
-            Err(SftpError::NotImplemented("validate_data"))
+            Err(SftpError::NotImplemented { name: "validate_data" })
         }
     }
 
@@ -413,7 +449,7 @@ impl SyncFilter for Filter {
         #[allow(unused_must_use)]
         {
             ticket.fail(CloudErrorKind::NotSupported);
-            Err(SftpError::NotImplemented("dehydrate"))
+            Err(SftpError::NotImplemented { name: "dehydrate" })
         }
     }
 
@@ -430,22 +466,99 @@ impl SyncFilter for Filter {
     // TODO: acknowledgement callbacks
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug, Clone)]
+struct RemotePath(Utf8UnixPathBuf);
+
+#[derive(Debug, Clone)]
+struct LocalPath(Utf8WindowsPathBuf);
+
+impl FromStr for RemotePath {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(RemotePath(Utf8UnixPathBuf::from_str(s)?))
+    }
+}
+
+impl Deref for RemotePath {
+    type Target = UnixPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<UnixPath> for RemotePath {
+    fn as_ref(&self) -> &UnixPath {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for RemotePath {
+    fn as_ref(&self) -> &Path {
+
+        &Utf8NativePath::from_bytes_path(&self.0)
+    }
+}
+
+impl RemotePath {
+    fn to_local(&self, sync_root: &LocalPath, remote_root: &RemotePath) -> Result<RemotePath, StripPrefixError> {
+        let relative = self.strip_prefix(remote_root)?;
+        Ok(RemotePath(sync_root.join(relative)))
+    }
+}
+
+impl FromStr for LocalPath {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(LocalPath(WindowsPathBuf::from_str(s)?))
+    }
+}
+
+impl Deref for LocalPath {
+    type Target = WindowsPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<WindowsPath> for LocalPath {
+    fn as_ref(&self) -> &WindowsPath {
+        &self.0
+    }
+}
+
+impl LocalPath {
+    fn to_remote(&self, sync_root: &LocalPath, remote_root: &RemotePath) -> Result<RemotePath, StripPrefixError> {
+        let relative = self.strip_prefix(sync_root)?;
+        Ok(RemotePath(remote_root.join(relative)))
+    }
+}
+
+#[derive(Snafu, Debug)]
 pub enum SftpError {
-    #[error(transparent)]
-    WinCSError(#[from] WinCSError),
+    #[snafu(transparent)]
+    WinCSError { source: WinCSError },
 
-    #[error(transparent)]
-    Windows(#[from] WindowsError),
+    #[snafu(transparent)]
+    Windows { source: WindowsError },
 
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    #[snafu(transparent)]
+    Io { source: io::Error },
 
-    #[error(transparent)]
-    Sftp(#[from] ssh2::Error),
+    #[snafu(transparent)]
+    Sftp { source: ssh2::Error },
 
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
+    #[snafu(transparent)]
+    PathStripPrefixError { source: StripPrefixError },
+
+    #[snafu(display("couldn't convert path: {path}"))]
+    CannotConvertTypedPath { path: std::path::PathBuf },
+
+    #[snafu(display("not implemented: {name}"))]
+    NotImplemented { name: &'static str },
 }
 
 fn wait_for_ctrlc() {
@@ -462,7 +575,7 @@ fn wait_for_ctrlc() {
 impl Into<CloudErrorKind> for SftpError {
     fn into(self) -> CloudErrorKind {
         match self {
-            Self::WinCSError(WinCSError::CloudError(ce)) => ce,
+            Self::WinCSError { source: WinCSError::CloudError(ce) } => ce,
             // Fall back to NotSupported for other types
             _ => CloudErrorKind::NotSupported,
         }
