@@ -9,16 +9,13 @@ use std::{
     sync::mpsc,
 };
 
+use clap::{arg, command, Parser};
 use rkyv::{Archive, Deserialize, Serialize};
 use ssh2::{Session, Sftp};
 use thiserror::Error;
 use widestring::{u16str, U16String};
 use wincs::{
-    ext::{ConvertOptions, FileExt},
-    filter::{info, ticket, SyncFilter},
-    placeholder_file::{Metadata, PlaceholderFile},
-    request::Request,
-    CloudErrorKind, PopulationType, Registration, SecurityId, SyncRootIdBuilder,
+    ext::{ConvertOptions, FileExt}, filter::{info, ticket, SyncFilter}, placeholder_file::{Metadata, PlaceholderFile}, request::Request, CloudErrorKind, WinCSError, PopulationType, Registration, SecurityId, SyncRootIdBuilder, WindowsError
 };
 
 // max should be 65536, this is done both in term-scp and sshfs because it's the
@@ -35,16 +32,34 @@ pub struct FileBlob {
     relative_path: String,
 }
 
+#[derive(Parser, Debug, Clone)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    username: String,
+
+    #[arg(short, long)]
+    password: String,
+
+    #[arg(long)]
+    host: String,
+
+    #[arg(short, long)]
+    mount_path: String,
+}
+
 fn main() {
-    let tcp = TcpStream::connect(env::var("SERVER").unwrap()).unwrap();
+    let args = Args::parse();
+
+    let tcp = TcpStream::connect(&args.host).unwrap();
     let mut session = Session::new().unwrap();
     session.set_blocking(true);
     session.set_tcp_stream(tcp);
     session.handshake().unwrap();
     session
         .userauth_password(
-            &env::var("USERNAME").unwrap_or_default(),
-            &env::var("PASSWORD").unwrap_or_default(),
+            &args.username,
+            &args.password,
         )
         .unwrap();
 
@@ -54,7 +69,7 @@ fn main() {
         .user_security_id(SecurityId::current_user().unwrap())
         .build();
 
-    let client_path = get_client_path();
+    let client_path = &args.mount_path;
     if !sync_root_id.is_registered().unwrap() {
         let u16_display_name = U16String::from_str(DISPLAY_NAME);
         Registration::from_sync_root_id(&sync_root_id)
@@ -74,17 +89,13 @@ fn main() {
     convert_to_placeholder(Path::new(&client_path));
 
     let connection = wincs::Session::new()
-        .connect(&client_path, Filter { sftp })
+        .connect(&client_path, Filter { sftp, args: args.clone() })
         .unwrap();
 
     wait_for_ctrlc();
 
     connection.disconnect().unwrap();
     sync_root_id.unregister().unwrap();
-}
-
-fn get_client_path() -> String {
-    env::var("CLIENT_PATH").unwrap()
 }
 
 fn convert_to_placeholder(path: &Path) {
@@ -116,6 +127,7 @@ fn convert_to_placeholder(path: &Path) {
 
 pub struct Filter {
     sftp: Sftp,
+    args: Args,
 }
 
 impl Filter {
@@ -177,8 +189,9 @@ impl Filter {
 // TODO: everything is just forwarded to external functions... This should be
 // changed in the wrapper api
 impl SyncFilter for Filter {
+    type Error = SftpError;
     // TODO: handle unwraps
-    fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) {
+    fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) -> Result<(), SftpError> {
         println!("fetch_data {:?}", request.file_blob());
         // TODO: handle unwrap
         let path = Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(request.file_blob()) });
@@ -233,16 +246,18 @@ impl SyncFilter for Filter {
         }();
 
         if let Err(e) = res {
-            ticket.fail(e).unwrap();
+            ticket.fail(e)?;
         }
+        Ok(())
     }
 
-    fn deleted(&self, _request: Request, _info: info::Deleted) {
+    fn deleted(&self, _request: Request, _info: info::Deleted) -> Result<(), SftpError> {
         println!("deleted");
+        Ok(())
     }
 
     // TODO: I probably also have to delete the file from the disk
-    fn delete(&self, request: Request, ticket: ticket::Delete, info: info::Delete) {
+    fn delete(&self, request: Request, ticket: ticket::Delete, info: info::Delete) -> Result<(), SftpError>{
         println!("delete {:?}", request.path());
         let path = Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(request.file_blob()) });
         let res = || -> Result<(), _> {
@@ -262,11 +277,12 @@ impl SyncFilter for Filter {
         if let Err(e) = res {
             ticket.fail(e).unwrap();
         }
+        Ok(())
     }
 
     // TODO: Do I have to move the file and set the file progress? or does the OS
     // handle that? (I think I do)
-    fn rename(&self, request: Request, ticket: ticket::Rename, info: info::Rename) {
+    fn rename(&self, request: Request, ticket: ticket::Rename, info: info::Rename) -> Result<(), SftpError>{
         let res = || -> Result<(), _> {
             match info.target_in_scope() {
                 true => {
@@ -309,6 +325,7 @@ impl SyncFilter for Filter {
         if let Err(e) = res {
             ticket.fail(e).unwrap();
         }
+        Ok(())
     }
 
     fn fetch_placeholders(
@@ -316,20 +333,19 @@ impl SyncFilter for Filter {
         request: Request,
         ticket: ticket::FetchPlaceholders,
         info: info::FetchPlaceholders,
-    ) {
+    ) -> Result<(), SftpError>{
         println!(
             "fetch_placeholders {:?} {:?}",
             request.path(),
             info.pattern()
         );
         let absolute = request.path();
-        let client_path = get_client_path();
-        let parent = absolute.strip_prefix(&client_path).unwrap();
+        let parent = absolute.strip_prefix(&self.args.mount_path).unwrap();
 
         let dirs = self.sftp.readdir(parent).unwrap();
-        let placeholders = dirs
+        let mut placeholders = dirs
             .into_iter()
-            .filter(|(path, _)| !Path::new(&client_path).join(path).exists())
+            .filter(|(path, _)| !Path::new(&self.args.mount_path).join(path).exists())
             .map(|(path, stat)| {
                 println!("path: {:?}, stat {:?}", path, stat);
                 println!("is file: {}, is dir: {}", stat.is_file(), stat.is_dir());
@@ -354,15 +370,18 @@ impl SyncFilter for Filter {
             })
             .collect::<Vec<_>>();
 
-        ticket.pass_with_placeholder(placeholders).unwrap();
+        ticket.pass_with_placeholder(&mut placeholders).unwrap();
+        Ok(())
     }
 
-    fn closed(&self, request: Request, info: info::Closed) {
+    fn closed(&self, request: Request, info: info::Closed) -> Result<(), SftpError> {
         println!("closed {:?}, deleted {}", request.path(), info.deleted());
+        Ok(())
     }
 
-    fn cancel_fetch_data(&self, _request: Request, _info: info::CancelFetchData) {
+    fn cancel_fetch_data(&self, _request: Request, _info: info::CancelFetchData) -> Result<(), SftpError> {
         println!("cancel_fetch_data");
+        Ok(())
     }
 
     fn validate_data(
@@ -370,36 +389,42 @@ impl SyncFilter for Filter {
         _request: Request,
         ticket: ticket::ValidateData,
         _info: info::ValidateData,
-    ) {
+    ) -> Result<(), SftpError>{
         println!("validate_data");
         #[allow(unused_must_use)]
         {
             ticket.fail(CloudErrorKind::NotSupported);
+            Err(SftpError::NotImplemented("validate_data"))
         }
     }
 
-    fn cancel_fetch_placeholders(&self, _request: Request, _info: info::CancelFetchPlaceholders) {
+    fn cancel_fetch_placeholders(&self, _request: Request, _info: info::CancelFetchPlaceholders) -> Result<(), SftpError>{
         println!("cancel_fetch_placeholders");
+        Ok(())
     }
 
-    fn opened(&self, request: Request, _info: info::Opened) {
+    fn opened(&self, request: Request, _info: info::Opened) -> Result<(), SftpError> {
         println!("opened: {:?}", request.path());
+        Ok(())
     }
 
-    fn dehydrate(&self, _request: Request, ticket: ticket::Dehydrate, _info: info::Dehydrate) {
+    fn dehydrate(&self, _request: Request, ticket: ticket::Dehydrate, _info: info::Dehydrate) -> Result<(), SftpError>{
         println!("dehydrate");
         #[allow(unused_must_use)]
         {
             ticket.fail(CloudErrorKind::NotSupported);
+            Err(SftpError::NotImplemented("dehydrate"))
         }
     }
 
-    fn dehydrated(&self, _request: Request, _info: info::Dehydrated) {
+    fn dehydrated(&self, _request: Request, _info: info::Dehydrated) -> Result<(), SftpError>{
         println!("dehydrated");
+        Ok(())
     }
 
-    fn renamed(&self, _request: Request, _info: info::Renamed) {
+    fn renamed(&self, _request: Request, _info: info::Renamed) -> Result<(), SftpError>{
         println!("renamed");
+        Ok(())
     }
 
     // TODO: acknowledgement callbacks
@@ -408,10 +433,19 @@ impl SyncFilter for Filter {
 #[derive(Error, Debug)]
 pub enum SftpError {
     #[error(transparent)]
+    WinCSError(#[from] WinCSError),
+
+    #[error(transparent)]
+    Windows(#[from] WindowsError),
+
+    #[error(transparent)]
     Io(#[from] io::Error),
 
     #[error(transparent)]
     Sftp(#[from] ssh2::Error),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(&'static str),
 }
 
 fn wait_for_ctrlc() {
@@ -423,4 +457,14 @@ fn wait_for_ctrlc() {
     .expect("Error setting Ctrl-C handler");
 
     rx.recv().unwrap();
+}
+
+impl Into<CloudErrorKind> for SftpError {
+    fn into(self) -> CloudErrorKind {
+        match self {
+            Self::WinCSError(WinCSError::CloudError(ce)) => ce,
+            // Fall back to NotSupported for other types
+            _ => CloudErrorKind::NotSupported,
+        }
+    }
 }

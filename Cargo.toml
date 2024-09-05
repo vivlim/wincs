@@ -32,6 +32,8 @@ windows = { version = "0.33.0", features = [
   "Win32_Security",
 ] }
 globset = { version = "0.4.9", optional = true }
+strum = { version = "0.26.3", features = ["derive"] }
+thiserror = "1.0.63"
 
 [features]
 # Enable globs in the `info::FetchPlaceholders` struct.
@@ -39,4 +41,4 @@ globs = ["globset"]
 
 # TODO: temporarily ignored
 [workspace]
-members = ["examples/sftp"]
+members = ["examples/sftp","examples/cloud-mirror"]

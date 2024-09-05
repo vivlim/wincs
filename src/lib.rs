@@ -16,6 +16,8 @@ pub mod usn;
 mod utility;
 
 pub use error::CloudErrorKind;
+pub use error::WinCSError as WinCSError;
+pub use windows::core::Error as WindowsError;
 pub use filter::{info, ticket, SyncFilter};
 pub use placeholder::{Placeholder, UpdateOptions};
 pub use placeholder_file::{BatchCreate, Metadata, PlaceholderFile};

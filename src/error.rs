@@ -1,7 +1,20 @@
+use thiserror::Error;
 use windows::Win32::Foundation::{self, NTSTATUS};
 
+#[derive(Error, Debug)]
+pub enum WinCSError {
+    #[error(transparent)]
+    CloudError(#[from] CloudErrorKind),
+
+    #[error(transparent)]
+    WindowsError(#[from] windows::core::Error),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(&'static str),
+}
+
 /// Predefined error types provided by the operating system.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, strum::Display, thiserror::Error)]
 pub enum CloudErrorKind {
     /// Access to the cloud file is denied.
     AccessDenied,

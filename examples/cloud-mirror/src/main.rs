@@ -12,14 +12,10 @@ use rkyv::{with::AsString, Archive, Deserialize, Serialize};
 use wfd::DialogParams;
 use wincs::{
     filter::{info, ticket, SyncFilter},
-    logger::ErrorReason,
     placeholder_file::PlaceholderFile,
     request::Request,
     root::{
-        connect::ConnectOptions,
-        register::{HydrationType, PopulationType, RegisterOptions, SupportedAttributes},
-        SyncRoot,
-    },
+    }, CloudErrorKind,
 };
 
 // MUST be a multiple of 4096
@@ -176,8 +172,7 @@ struct Filter {
 
 impl SyncFilter for Filter {
     type Error = FilterError;
-
-    fn fetch_data(&self, request: Request, info: info::FetchData) -> Result<(), Self::Error> {
+    fn fetch_data(&self, request: Request, _ticket: ticket::FetchData, info: info::FetchData) -> Result<(), FilterError> {
         let blob = request.file_blob::<FileBlob, SCRATCH_SPACE>().unwrap();
 
         // TODO: this is the same as just using path with the drive letter attached
@@ -241,12 +236,12 @@ impl SyncFilter for Filter {
         request: Request,
         ticket: ticket::ValidateData,
         info: info::ValidateData,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         println!("validate data");
         Ok(())
     }
 
-    fn cancel_fetch_data(&self, request: Request, info: info::Cancel) -> Result<(), Self::Error> {
+    fn cancel_fetch_data(&self, request: Request, info: info::Cancel) -> Result<(), FilterError> {
         println!("cancel fetch data");
         Ok(())
     }
@@ -255,7 +250,7 @@ impl SyncFilter for Filter {
         &self,
         request: Request,
         info: info::FetchPlaceholders,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         println!("fetch placeholders");
         Ok(())
     }
@@ -264,17 +259,17 @@ impl SyncFilter for Filter {
         &self,
         request: Request,
         info: info::Cancel,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         println!("cancel fetch placeholders");
         Ok(())
     }
 
-    fn opened(&self, request: Request, info: info::Opened) -> Result<(), Self::Error> {
+    fn opened(&self, request: Request, info: info::Opened) -> Result<(), FilterError> {
         println!("file opened {:?}", request.path());
         Ok(())
     }
 
-    fn closed(&self, request: Request, info: info::Closed) -> Result<(), Self::Error> {
+    fn closed(&self, request: Request, info: info::Closed) -> Result<(), FilterError> {
         println!("file closed {:?}", request.path());
         Ok(())
     }
@@ -284,12 +279,12 @@ impl SyncFilter for Filter {
         request: Request,
         ticket: ticket::Dehydrate,
         info: info::Dehydrate,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         println!("dehydrate");
         Ok(())
     }
 
-    fn dehydrated(&self, request: Request, info: info::Dehydrated) -> Result<(), Self::Error> {
+    fn dehydrated(&self, request: Request, info: info::Dehydrated) -> Result<(), FilterError> {
         println!("dehydrated");
 
         Ok(())
@@ -300,12 +295,12 @@ impl SyncFilter for Filter {
         request: Request,
         ticket: ticket::Delete,
         info: info::Delete,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         println!("delete");
         Ok(())
     }
 
-    fn deleted(&self, request: Request, info: info::Deleted) -> Result<(), Self::Error> {
+    fn deleted(&self, request: Request, info: info::Deleted) -> Result<(), FilterError> {
         println!("deleted");
         Ok(())
     }
@@ -315,7 +310,7 @@ impl SyncFilter for Filter {
         request: Request,
         ticket: ticket::Rename,
         info: info::Rename,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), FilterError> {
         let source_path = request.path();
         println!(
             "rename\n\tsource_path: {:?}\n\ttarget_path: {:?}",
@@ -353,13 +348,21 @@ impl SyncFilter for Filter {
         Ok(())
     }
 
-    fn renamed(&self, request: Request, info: info::Renamed) -> Result<(), Self::Error> {
+    fn renamed(&self, request: Request, info: info::Renamed) -> Result<(), FilterError> {
         println!("renamed");
         Ok(())
     }
 }
 
-pub struct FilterError;
+pub enum FilterError {
+    CloudError(CloudErrorKind)
+}
+
+impl From<FilterError> for CloudErrorKind {
+    fn from(value: FilterError) -> Self {
+        FilterError::CloudError(value)
+    }
+}
 
 impl ErrorReason for FilterError {
     fn code(&self) -> u32 {
